@@ -8,18 +8,146 @@
 
 #define CPU_RECURSIVE_VERSION
 #define CUDA_NORMAL_SEPERATE_MODE
+#define CUDA_SHARED_MEMORY_MODE	
 
 int * result_arr;
 int * arr;
 int * origin_arr;
-int arr_length = 1024 * 1024 * 10 + 5;
+int arr_length = 1024 * 1024 * 16 + 5;
 void print();
 bool CheckPowOfTwo(int num);
 void check();
 
+#ifdef CUDA_SHARED_MEMORY_MODE	
+__global__ void bitonic_in_block_shared(int *d_arr) {
+   int TID = blockIdx.y * (gridDim.x * (blockDim.x * blockDim.y * blockDim.z)) + (blockIdx.x * (blockDim.x * blockDim.y * blockDim.z)) + (blockDim.x * threadIdx.y) + threadIdx.x;
+   int half_of_stride, flag, offset, temp, target;
+
+   __shared__ int sh[1024];
+
+   int TID_IN_BLOCK = (blockDim.x * threadIdx.y) + threadIdx.x;
+
+   sh[TID_IN_BLOCK] = d_arr[TID];
+   __syncthreads();
+
+   for (int size = 2; size <= blockDim.x * blockDim.y; size = size << 1) {
+      flag = 0;
+      for (int stride = size; stride > 1; stride = stride >> 1) {
+         half_of_stride = stride >> 1;
+         offset = TID % stride;
+         if (offset < half_of_stride) {
+            if (flag == 0) {
+               target = TID_IN_BLOCK + stride - 1 - 2 * offset;
+            }
+            else {
+               target = TID_IN_BLOCK + half_of_stride;
+            }
+
+            if (sh[TID_IN_BLOCK] > sh[target]) {
+               temp = sh[target];
+               sh[target] = sh[TID_IN_BLOCK];
+               sh[TID_IN_BLOCK] = temp;
+            }
+         }
+
+         __syncthreads();
+         flag = 1;
+      }
+   }
+
+   d_arr[TID] = sh[TID_IN_BLOCK];
+}
+
+__global__ void bitonic_merge_between_block_shared(int *d_arr, int stride, int flag) {
+   int TID = blockIdx.y * (gridDim.x * (blockDim.x * blockDim.y * blockDim.z)) + (blockIdx.x * (blockDim.x * blockDim.y * blockDim.z)) + (blockDim.x * threadIdx.y) + threadIdx.x;
+   int target, temp;
+   int offset = TID % stride;
+   int half_of_stride = stride >> 1;
+
+   if (offset < half_of_stride) {
+      if (flag == 0) {
+         target = TID + stride - 1 - 2 * offset;
+      }
+      else {
+         target = TID + half_of_stride;
+      }
+
+      if (d_arr[TID] > d_arr[target]) {
+         temp = d_arr[target];
+         d_arr[target] = d_arr[TID];
+         d_arr[TID] = temp;
+      }
+   }
+}
+
+__global__ void bitonic_merge_in_block_shared(int * d_arr, int stride) {
+   int TID = blockIdx.y * (gridDim.x * (blockDim.x * blockDim.y * blockDim.z)) + (blockIdx.x * (blockDim.x * blockDim.y * blockDim.z)) + (blockDim.x * threadIdx.y) + threadIdx.x;
+   int half_of_stride, target, temp;
+
+   __shared__ int sh[1024];
+  
+   int TID_IN_BLOCK = blockDim.x * threadIdx.y + threadIdx.x;
+
+   sh[TID_IN_BLOCK] = d_arr[TID];
+   __syncthreads();
+
+   while (stride > 1) {
+      half_of_stride = stride >> 1;
+
+      if (TID % stride < half_of_stride) {
+         target = TID_IN_BLOCK + half_of_stride;
+
+         if (sh[TID_IN_BLOCK] > sh[target]) {
+            temp = sh[target];
+            sh[target] = sh[TID_IN_BLOCK];
+            sh[TID_IN_BLOCK] = temp;
+         }
+      }
+
+      __syncthreads();
+
+      stride = stride >> 1;
+   }
+
+   d_arr[TID] = sh[TID_IN_BLOCK];
+}
+
+void bitonic_sort_from_host_shared(int n, int dx, int dy, int block_size) {
+    int num_threads_in_block = (block_size * block_size);
+
+    int * d_arr;
+
+    cudaMalloc(&d_arr, sizeof(int) * n);
+    cudaMemcpy(d_arr, arr, sizeof(int) * n, cudaMemcpyHostToDevice);
+
+    int flag;
+    dim3 dimGrid(dx / block_size, dy / block_size);
+    dim3 dimBlock(block_size, block_size);
+
+    bitonic_in_block_shared << <dimGrid, dimBlock >> > (d_arr);
+
+    for (int size = 2 * num_threads_in_block ; size <= n; size = size << 1) {
+        flag = 0;
+
+        for (int stride = size; stride > num_threads_in_block; stride >>= 1) {
+            bitonic_merge_between_block_shared << <dimGrid, dimBlock >> > (d_arr, stride, flag);
+            flag = 1;
+        }
+
+        bitonic_merge_in_block_shared << < dimGrid, dimBlock >> > (d_arr, num_threads_in_block);
+    }
+
+    cudaMemcpy(arr, d_arr, sizeof(int) * n, cudaMemcpyDeviceToHost);
+
+    cudaFree(d_arr);
+}
+
+#endif
+
+
 #ifdef CUDA_NORMAL_SEPERATE_MODE
 
-__global__ void bitonic_in_block(int *d_arr, int n) {
+__global__ void bitonic_in_block(int *d_arr) {
     int TID = blockIdx.y * (gridDim.x * (blockDim.x * blockDim.y * blockDim.z)) + (blockIdx.x * (blockDim.x * blockDim.y * blockDim.z)) + (blockDim.x * threadIdx.y) + threadIdx.x;
     int half_of_stride, flag, offset, temp, target;
 
@@ -52,7 +180,7 @@ __global__ void bitonic_in_block(int *d_arr, int n) {
     }
 }
 
-__global__ void bitonic_merge_between_block(int *d_arr, int n, int stride, int flag) {
+__global__ void bitonic_merge_between_block(int *d_arr, int stride, int flag) {
     int TID = blockIdx.y * (gridDim.x * (blockDim.x * blockDim.y * blockDim.z)) + (blockIdx.x * (blockDim.x * blockDim.y * blockDim.z)) + (blockDim.x * threadIdx.y) + threadIdx.x;
     int target, temp;
     int offset = TID % stride;
@@ -60,7 +188,7 @@ __global__ void bitonic_merge_between_block(int *d_arr, int n, int stride, int f
 
     if (offset < half_of_stride) {
         if (flag == 0) {
-            target = TID + stride - 1 - offset - offset;
+            target = TID + stride - 1 - 2*offset;
         }
         else {
             target = TID + half_of_stride;
@@ -74,7 +202,7 @@ __global__ void bitonic_merge_between_block(int *d_arr, int n, int stride, int f
     }
 }
 
-__global__ void bitonic_merge_in_block(int * d_arr, int n, int stride) {
+__global__ void bitonic_merge_in_block(int * d_arr, int stride) {
     int TID = blockIdx.y * (gridDim.x * (blockDim.x * blockDim.y * blockDim.z)) + (blockIdx.x * (blockDim.x * blockDim.y * blockDim.z)) + (blockDim.x * threadIdx.y) + threadIdx.x;
 
     int half_of_stride, target, temp;
@@ -110,17 +238,17 @@ void bitonic_sort_from_host(int n, int dx, int dy, int block_size) {
     dim3 dimGrid(dx / block_size, dy / block_size);
     dim3 dimBlock(block_size, block_size);
 
-    bitonic_in_block << <dimGrid, dimBlock >> > (d_arr, n);
+    bitonic_in_block << <dimGrid, dimBlock >> > (d_arr);
 
     for (int size = 2 * num_threads_in_block ; size <= n; size = size << 1) {
         flag = 0;
 
         for (int stride = size; stride > num_threads_in_block; stride >>= 1) {
-            bitonic_merge_between_block << <dimGrid, dimBlock >> > (d_arr, n, stride, flag);
+            bitonic_merge_between_block << <dimGrid, dimBlock >> > (d_arr, stride, flag);
             flag = 1;
         }
 
-        bitonic_merge_in_block << < dimGrid, dimBlock >> > (d_arr, n, num_threads_in_block);
+        bitonic_merge_in_block << < dimGrid, dimBlock >> > (d_arr, num_threads_in_block);
     }
 
     cudaMemcpy(arr, d_arr, sizeof(int) * n, cudaMemcpyDeviceToHost);
@@ -262,6 +390,8 @@ int main(int argc, char * argv[]) {
         origin_arr[arr_length + i] = INT_MAX;
     }
 
+    printf("array size = %d^%d\n", 2, powNum);
+    
 #ifdef CPU_RECURSIVE_VERSION
     timer.onTimer(0);
     BitonicSort(0, arr_length + padding, true);
@@ -296,10 +426,30 @@ int main(int argc, char * argv[]) {
 	}
 #endif
 
+#ifdef CUDA_SHARED_MEMORY_MODE	
+	for(int i=1 ; i<=3 ; i++) {
+		timer.onTimer(i+3);
+
+		bitonic_sort_from_host_shared(arr_length + padding, dx, dy, 8 * pow(2, i-1));
+		cudaThreadSynchronize();
+
+		timer.offTimer(i+3);
+
+		check();
+
+		for (int i = 0; i < arr_length; i++) {
+			arr[i] = origin_arr[i];
+		}
+	}
+#endif
+
     timer.setTimerName(0, "cpu recursive bitonic");
     timer.setTimerName(1, "gpu normal 8 thread in block ");
     timer.setTimerName(2, "gpu normal 16 thread in block ");
     timer.setTimerName(3, "gpu normal 32 thread in block ");
+    timer.setTimerName(4, "gpu shared 8 thread in block ");
+    timer.setTimerName(5, "gpu shared 16 thread in block ");
+    timer.setTimerName(6, "gpu shared 32 thread in block ");
 
     free(arr);
     free(result_arr);
